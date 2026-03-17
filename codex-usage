@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""
+codex-usage — Check OpenAI Codex usage limits across all accounts.
+
+Reads all *.auth.json files (and auth.json) from ~/.codex/ and queries
+the ChatGPT usage API to show 5-hour and 7-day rate limit windows.
+
+Usage:
+  codex-usage              # show all accounts
+  codex-usage --json       # raw JSON output
+  codex-usage --fix        # switch to the best available account
+  codex-usage --fix --json # switch + machine-readable output
+  codex-usage --compact    # one-line-per-account table view
+  codex-usage --workers 50 # control concurrency (default: 20)
+"""
+
+import asyncio
+import json
+import os
+import shutil
+import sys
+import base64
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+CODEX_DIR = Path.home() / ".codex"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+DEFAULT_WORKERS = 20      # concurrent HTTP requests
+REQUEST_TIMEOUT = 15      # seconds per request
+
+# ---------------------------------------------------------------------------
+# ANSI colors
+# ---------------------------------------------------------------------------
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+WHITE = "\033[37m"
+BG_RED = "\033[41m"
+CLEAR_LINE = "\033[2K\r"
+
+# Disable colors if not a TTY
+if not sys.stderr.isatty():
+    RESET = BOLD = DIM = RED = GREEN = YELLOW = BLUE = MAGENTA = CYAN = WHITE = BG_RED = CLEAR_LINE = ""
+
+
+def decode_jwt_payload(token: str) -> dict:
+    """Decode JWT payload without verification."""
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1] + "=="
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Auth file loading
+# ---------------------------------------------------------------------------
+
+def load_auth_files() -> list[dict]:
+    """Find and load all auth.json files, deduplicated by account_id."""
+    main_auth = CODEX_DIR / "auth.json"
+
+    # Determine which account_id is currently active
+    active_account_id = None
+    if main_auth.exists():
+        try:
+            with open(main_auth) as f:
+                active_data = json.load(f)
+            active_account_id = active_data.get("tokens", {}).get("account_id")
+        except Exception:
+            pass
+
+    # Collect named auth files (skip the generic auth.json)
+    entries = []
+    seen_accounts = set()
+
+    for p in sorted(CODEX_DIR.glob("*.auth.json")):
+        name = p.stem.replace(".auth", "")
+        try:
+            with open(p) as f:
+                data = json.load(f)
+
+            tokens = data.get("tokens", {})
+            access_token = tokens.get("access_token")
+            account_id = tokens.get("account_id")
+
+            if not access_token or not account_id:
+                continue
+            if account_id in seen_accounts:
+                continue
+            seen_accounts.add(account_id)
+
+            id_token = tokens.get("id_token", "")
+            jwt_payload = decode_jwt_payload(id_token)
+            email = jwt_payload.get("email", "unknown")
+            auth_info = jwt_payload.get("https://api.openai.com/auth", {})
+            plan_type = auth_info.get("chatgpt_plan_type", "unknown")
+
+            entries.append({
+                "name": name,
+                "path": str(p),
+                "email": email,
+                "plan_type": plan_type,
+                "account_id": account_id,
+                "access_token": access_token,
+                "is_active": account_id == active_account_id,
+                "has_backup": True,
+            })
+        except Exception as e:
+            entries.append({"name": name, "path": str(p), "error": str(e)})
+
+    # If active account has no named backup, add from auth.json
+    if active_account_id and active_account_id not in seen_accounts:
+        try:
+            with open(main_auth) as f:
+                data = json.load(f)
+            tokens = data.get("tokens", {})
+            jwt_payload = decode_jwt_payload(tokens.get("id_token", ""))
+            email = jwt_payload.get("email", "unknown")
+            auth_info = jwt_payload.get("https://api.openai.com/auth", {})
+
+            entries.insert(0, {
+                "name": "active",
+                "path": str(main_auth),
+                "email": email,
+                "plan_type": auth_info.get("chatgpt_plan_type", "unknown"),
+                "account_id": active_account_id,
+                "access_token": tokens.get("access_token"),
+                "is_active": True,
+                "has_backup": False,
+            })
+        except Exception:
+            pass
+
+    # Sort: active first, then alphabetically by email
+    entries.sort(key=lambda x: (not x.get("is_active", False), x.get("email", "")))
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Usage fetching — concurrent
+# ---------------------------------------------------------------------------
+
+def fetch_usage_sync(access_token: str, account_id: str) -> dict:
+    """Fetch usage data from ChatGPT API (blocking)."""
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "chatgpt-account-id": account_id,
+        "accept": "*/*",
+    })
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _fetch_one(account: dict) -> dict:
+    """Fetch usage for a single account, returning a result dict."""
+    if "error" in account:
+        return account
+
+    try:
+        usage = fetch_usage_sync(account["access_token"], account["account_id"])
+        rate_limit = usage.get("rate_limit") or {}
+        primary = rate_limit.get("primary_window") or {}
+        secondary = rate_limit.get("secondary_window") or {}
+
+        five_hour_used = primary.get("used_percent", 0) or 0
+        five_hour_reset = primary.get("reset_after_seconds", 0) or 0
+        seven_day_used = secondary.get("used_percent", 0) or 0
+        seven_day_reset = secondary.get("reset_after_seconds", 0) or 0
+
+        return {
+            "name": account["name"],
+            "path": account["path"],
+            "email": account["email"],
+            "plan_type": usage.get("plan_type", account["plan_type"]),
+            "is_active": account["is_active"],
+            "has_backup": account.get("has_backup", True),
+            "limit_reached": rate_limit.get("limit_reached", False),
+            "allowed": rate_limit.get("allowed", True),
+            "five_hour": {
+                "used_percent": five_hour_used,
+                "left_percent": round(100 - five_hour_used, 1),
+                "reset_seconds": five_hour_reset,
+                "reset_human": format_time_remaining(five_hour_reset),
+            },
+            "seven_day": {
+                "used_percent": seven_day_used,
+                "left_percent": round(100 - seven_day_used, 1),
+                "reset_seconds": seven_day_reset,
+                "reset_human": format_time_remaining(seven_day_reset),
+            },
+        }
+
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            msg = "Token expired (401) — run: codex login"
+        elif e.code == 403:
+            msg = "Access denied (403)"
+        elif e.code == 429:
+            msg = "Rate limited by API (429) — try fewer workers"
+        else:
+            body = ""
+            try:
+                body = e.read().decode()[:200]
+            except Exception:
+                pass
+            msg = f"HTTP {e.code}: {body}"
+        return {"name": account["name"], "email": account.get("email", "?"), "error": msg}
+
+    except Exception as e:
+        return {"name": account["name"], "email": account.get("email", "?"), "error": str(e)}
+
+
+def fetch_all_usage(accounts: list[dict], max_workers: int, show_progress: bool = False) -> list[dict]:
+    """Fetch usage for all accounts concurrently."""
+    n = len(accounts)
+    results = [None] * n
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, n)) as pool:
+        future_to_idx = {pool.submit(_fetch_one, acc): i for i, acc in enumerate(accounts)}
+
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            results[idx] = future.result()
+            completed += 1
+            if show_progress and n > 5:
+                pct = completed * 100 // n
+                sys.stderr.write(f"{CLEAR_LINE}  Fetching usage... {completed}/{n} ({pct}%)")
+                sys.stderr.flush()
+
+    if show_progress and n > 5:
+        sys.stderr.write(f"{CLEAR_LINE}")
+        sys.stderr.flush()
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+def format_time_remaining(seconds: float) -> str:
+    if seconds <= 0:
+        return "now"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    if minutes > 0:
+        return f"{minutes}m"
+    return f"{int(seconds)}s"
+
+
+def colorize_percent_used(used_pct: float) -> str:
+    left_pct = 100 - used_pct
+    if left_pct <= 0:
+        return f"{BG_RED}{WHITE}{BOLD} {used_pct:5.1f}% used {RESET}"
+    elif left_pct <= 10:
+        return f"{RED}{BOLD}{used_pct:5.1f}% used{RESET}"
+    elif left_pct <= 25:
+        return f"{YELLOW}{used_pct:5.1f}% used{RESET}"
+    elif left_pct <= 50:
+        return f"{WHITE}{used_pct:5.1f}% used{RESET}"
+    else:
+        return f"{GREEN}{used_pct:5.1f}% used{RESET}"
+
+
+def make_bar(used_pct: float, width: int = 20) -> str:
+    filled = int(round(used_pct / 100 * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    if used_pct >= 100:
+        color = BG_RED + WHITE
+    elif used_pct >= 75:
+        color = RED
+    elif used_pct >= 50:
+        color = YELLOW
+    else:
+        color = GREEN
+    bar = f"{color}{'█' * filled}{DIM}{'░' * empty}{RESET}"
+    return f"[{bar}]"
+
+
+def make_mini_bar(used_pct: float, width: int = 10) -> str:
+    """Compact bar for table view."""
+    filled = int(round(used_pct / 100 * width))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+    if used_pct >= 100:
+        color = RED
+    elif used_pct >= 75:
+        color = YELLOW
+    else:
+        color = GREEN
+    return f"{color}{'█' * filled}{DIM}{'░' * empty}{RESET}"
+
+
+def print_separator(char="─", width=60):
+    print(f"{DIM}{char * width}{RESET}")
+
+
+# ---------------------------------------------------------------------------
+# Display modes
+# ---------------------------------------------------------------------------
+
+def display_detailed(results: list[dict]):
+    """Full detailed view (original)."""
+    for r in results:
+        if "error" in r:
+            print(f"  {RED}✗ {r.get('email', r['name'])}: {r['error']}{RESET}")
+            print()
+            continue
+
+        active_badge = f" {GREEN}● ACTIVE{RESET}" if r["is_active"] else ""
+        unbacked_badge = f" {YELLOW}⚠ UNBACKED{RESET}" if r.get("has_backup") is False else ""
+        plan_color = MAGENTA if r["plan_type"] == "team" else BLUE
+        plan_badge = f"{plan_color}{r['plan_type'].upper()}{RESET}"
+
+        limited = r.get("limit_reached") or not r.get("allowed", True)
+        status_icon = f"{RED}🚫 RATE LIMITED{RESET}" if limited else f"{GREEN}✓{RESET}"
+
+        print(f"  {BOLD}{r['email']}{RESET} {DIM}({r['name']}){RESET} [{plan_badge}]{active_badge}{unbacked_badge}")
+        print(f"  Status: {status_icon}")
+        print()
+
+        fh = r["five_hour"]
+        sd = r["seven_day"]
+        print(f"    {BOLD}5h window{RESET}  {make_bar(fh['used_percent'])}  {colorize_percent_used(fh['used_percent'])}")
+        print(f"    {DIM}           resets in {fh['reset_human']}{RESET}")
+        print(f"    {BOLD}7d window{RESET}  {make_bar(sd['used_percent'])}  {colorize_percent_used(sd['used_percent'])}")
+        print(f"    {DIM}           resets in {sd['reset_human']}{RESET}")
+        print()
+        print_separator()
+        print()
+
+
+def display_compact(results: list[dict]):
+    """One-line-per-account table for large numbers of accounts."""
+    # Header
+    print(f"  {BOLD}{'Account':<35} {'Plan':<6} {'5h':<16} {'7d':<16} {'Reset':<10} {'Status':<10}{RESET}")
+    print_separator("─", 95)
+
+    for r in results:
+        if "error" in r:
+            email = r.get("email", r["name"])[:33]
+            print(f"  {email:<35} {'?':<6} {'?':<16} {'?':<16} {'?':<10} {RED}ERR{RESET}")
+            continue
+
+        limited = r.get("limit_reached") or not r.get("allowed", True)
+        email = r["email"][:33]
+        active = "●" if r["is_active"] else " "
+        plan = r["plan_type"][:5]
+
+        fh_pct = r["five_hour"]["used_percent"]
+        sd_pct = r["seven_day"]["used_percent"]
+
+        fh_col = f"{make_mini_bar(fh_pct)} {fh_pct:5.1f}%"
+        sd_col = f"{make_mini_bar(sd_pct)} {sd_pct:5.1f}%"
+
+        # Show the binding reset time
+        if sd_pct >= 100:
+            reset = r["seven_day"]["reset_human"]
+        elif fh_pct >= 100:
+            reset = r["five_hour"]["reset_human"]
+        else:
+            reset = "—"
+
+        status = f"{RED}LIMITED{RESET}" if limited else f"{GREEN}OK{RESET}"
+        unbacked = f" {YELLOW}!{RESET}" if r.get("has_backup") is False else ""
+
+        print(f"  {active} {email:<33} {plan:<6} {fh_col} {sd_col} {reset:<10} {status}{unbacked}")
+
+    print()
+
+
+def display_summary(results: list[dict]):
+    """Print summary line."""
+    total = len([r for r in results if "error" not in r])
+    limited = len([r for r in results if r.get("limit_reached") or not r.get("allowed", True)])
+    available = total - limited
+    errors = len([r for r in results if "error" in r])
+
+    parts = [f"{BOLD}{total} accounts{RESET}"]
+    if available > 0:
+        parts.append(f"{GREEN}{available} available{RESET}")
+    if limited > 0:
+        parts.append(f"{RED}{limited} rate-limited{RESET}")
+    if errors > 0:
+        parts.append(f"{YELLOW}{errors} errors{RESET}")
+    print(f"  {' · '.join(parts)}")
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Account selection & switching
+# ---------------------------------------------------------------------------
+
+def pick_best_account(results: list[dict]) -> dict | None:
+    """Pick the best account to switch to.
+
+    Strategy:
+      1. Among non-limited accounts, pick the one with the most 7d headroom.
+      2. If ALL accounts are limited, pick the one that resets soonest.
+    """
+    valid = [r for r in results if "error" not in r]
+    if not valid:
+        return None
+
+    available = [r for r in valid if not r.get("limit_reached") and r.get("allowed", True)]
+
+    if available:
+        available.sort(key=lambda r: (r["seven_day"]["used_percent"], r["five_hour"]["used_percent"]))
+        return available[0]
+
+    # All limited — pick soonest reset
+    def soonest_reset(r):
+        if r["seven_day"]["used_percent"] >= 100:
+            return r["seven_day"]["reset_seconds"]
+        if r["five_hour"]["used_percent"] >= 100:
+            return r["five_hour"]["reset_seconds"]
+        return min(r["five_hour"]["reset_seconds"], r["seven_day"]["reset_seconds"])
+
+    valid.sort(key=soonest_reset)
+    return valid[0]
+
+
+def ensure_current_auth_backed_up(quiet: bool = False) -> bool:
+    """Ensure the current auth.json has a named *.auth.json backup.
+
+    If not, auto-create one derived from the JWT email before any overwrite.
+    """
+    main_auth = CODEX_DIR / "auth.json"
+    if not main_auth.exists():
+        return True
+
+    try:
+        with open(main_auth) as f:
+            data = json.load(f)
+        tokens = data.get("tokens", {})
+        account_id = tokens.get("account_id")
+        if not account_id:
+            return True
+    except Exception:
+        return True
+
+    # Check if any named *.auth.json has this account_id
+    for p in CODEX_DIR.glob("*.auth.json"):
+        try:
+            with open(p) as f:
+                named = json.load(f)
+            if named.get("tokens", {}).get("account_id") == account_id:
+                return True
+        except Exception:
+            continue
+
+    # Not backed up — create one
+    id_token = tokens.get("id_token", "")
+    jwt_payload = decode_jwt_payload(id_token)
+    email = jwt_payload.get("email", "")
+
+    if email:
+        safe_name = email.split("@")[0].replace(".", "-").replace("+", "-")
+        backup_path = CODEX_DIR / f"{safe_name}.auth.json"
+        suffix = 2
+        while backup_path.exists():
+            backup_path = CODEX_DIR / f"{safe_name}-{suffix}.auth.json"
+            suffix += 1
+    else:
+        backup_path = CODEX_DIR / f"account-{account_id[:8]}.auth.json"
+
+    shutil.copy2(main_auth, backup_path)
+    os.chmod(str(backup_path), 0o600)
+
+    if not quiet:
+        display_name = email or account_id[:12]
+        print(f"  {CYAN}💾 Backed up current auth → {backup_path.name}{RESET}")
+        print(f"    Account: {display_name}")
+        print()
+
+    return True
+
+
+def switch_account(account: dict, quiet: bool = False) -> bool:
+    """Copy named auth file → auth.json. Always backs up current first."""
+    source = Path(account["path"])
+    target = CODEX_DIR / "auth.json"
+
+    if not source.exists():
+        return False
+    if not ensure_current_auth_backed_up(quiet=quiet):
+        return False
+
+    shutil.copy2(source, target)
+    return True
+
+
+def handle_fix(results: list[dict], json_mode: bool):
+    """Handle --fix: switch to the best account."""
+    best = pick_best_account(results)
+    if not best:
+        if not json_mode:
+            print(f"  {RED}✗ No usable accounts found{RESET}")
+            print()
+        sys.exit(1)
+
+    current_active = next((r for r in results if r.get("is_active")), None)
+    already_active = current_active and current_active.get("name") == best.get("name")
+    is_limited = best.get("limit_reached") or not best.get("allowed", True)
+
+    if already_active:
+        if is_limited:
+            reset_secs = _binding_reset(best)
+            if json_mode:
+                print(json.dumps({"action": "none", "reason": "already_best_but_limited",
+                                  "account": best["name"], "email": best["email"],
+                                  "resets_in": format_time_remaining(reset_secs)}))
+            else:
+                print(f"  {YELLOW}⚠ Already on best account:{RESET} {BOLD}{best['email']}{RESET} {DIM}({best['name']}){RESET}")
+                print(f"    All accounts are rate-limited. Resets in {BOLD}{format_time_remaining(reset_secs)}{RESET}")
+                print()
+        else:
+            if json_mode:
+                print(json.dumps({"action": "none", "reason": "already_best",
+                                  "account": best["name"], "email": best["email"]}))
+            else:
+                pct_left = 100 - best["seven_day"]["used_percent"]
+                print(f"  {GREEN}✓ Already on best account:{RESET} {BOLD}{best['email']}{RESET} {DIM}({best['name']}){RESET}")
+                print(f"    7d: {pct_left:.0f}% left")
+                print()
+    else:
+        if switch_account(best):
+            if json_mode:
+                out = {"action": "switched", "account": best["name"], "email": best["email"],
+                       "limited": is_limited,
+                       "seven_day_used": best["seven_day"]["used_percent"],
+                       "five_hour_used": best["five_hour"]["used_percent"]}
+                if is_limited:
+                    out["resets_in"] = format_time_remaining(_binding_reset(best))
+                print(json.dumps(out))
+            else:
+                prev_name = current_active["email"] if current_active else "unknown"
+                print(f"  {GREEN}{BOLD}⚡ Switched active account{RESET}")
+                print(f"    {DIM}{prev_name}{RESET} → {BOLD}{best['email']}{RESET} {DIM}({best['name']}){RESET}")
+                if is_limited:
+                    print(f"    {YELLOW}⚠ Still rate-limited{RESET} (best available, resets in {format_time_remaining(_binding_reset(best))})")
+                else:
+                    print(f"    5h: {GREEN}{100 - best['five_hour']['used_percent']:.0f}% left{RESET}  ·  7d: {GREEN}{100 - best['seven_day']['used_percent']:.0f}% left{RESET}")
+                print()
+        else:
+            if json_mode:
+                print(json.dumps({"action": "error", "reason": "copy_failed", "account": best["name"]}))
+            else:
+                print(f"  {RED}✗ Failed to switch to {best['email']}{RESET}")
+                print()
+            sys.exit(1)
+
+
+def _binding_reset(r: dict) -> float:
+    """Return the reset seconds for the binding (maxed-out) window."""
+    if r["seven_day"]["used_percent"] >= 100:
+        return r["seven_day"]["reset_seconds"]
+    return r["five_hour"]["reset_seconds"]
+
+
+# ---------------------------------------------------------------------------
+# CLI argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    args = sys.argv[1:]
+    opts = {
+        "json": False,
+        "fix": False,
+        "compact": False,
+        "workers": DEFAULT_WORKERS,
+    }
+    i = 0
+    while i < len(args):
+        if args[i] == "--json":
+            opts["json"] = True
+        elif args[i] == "--fix":
+            opts["fix"] = True
+        elif args[i] == "--compact":
+            opts["compact"] = True
+        elif args[i] == "--workers" and i + 1 < len(args):
+            i += 1
+            opts["workers"] = max(1, min(200, int(args[i])))
+        elif args[i] in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        i += 1
+    return opts
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    opts = parse_args()
+    json_mode = opts["json"]
+    fix_mode = opts["fix"]
+    compact_mode = opts["compact"]
+    max_workers = opts["workers"]
+
+    accounts = load_auth_files()
+    n = len(accounts)
+
+    if not accounts:
+        if json_mode:
+            print(json.dumps({"error": "no auth files found", "path": str(CODEX_DIR)}))
+        else:
+            print(f"{RED}No auth.json files found in {CODEX_DIR}{RESET}")
+        sys.exit(1)
+
+    # Auto-compact for large numbers of accounts
+    if n > 10 and not compact_mode and not json_mode:
+        compact_mode = True
+
+    if not json_mode:
+        print()
+        print(f"  {BOLD}{CYAN}⚡ Codex Usage Monitor{RESET}  {DIM}({n} accounts, {max_workers} workers){RESET}")
+        print(f"  {DIM}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{RESET}")
+        print()
+
+    # Fetch all usage concurrently
+    show_progress = not json_mode and n > 5
+    results = fetch_all_usage(accounts, max_workers, show_progress=show_progress)
+
+    # Display
+    if json_mode and not fix_mode:
+        print(json.dumps(results, indent=2))
+    elif not json_mode:
+        if compact_mode:
+            display_compact(results)
+        else:
+            display_detailed(results)
+        display_summary(results)
+
+    # --fix
+    if fix_mode:
+        handle_fix(results, json_mode)
+
+
+if __name__ == "__main__":
+    main()
