@@ -11,10 +11,6 @@ Check OpenAI Codex usage limits (5h & 7d windows) across all your accounts, with
 curl -fSL https://github.com/SamuelLHuber/ai-sub-usage-tracker/releases/latest/download/codex-usage-macos-arm64 -o codex-usage
 chmod +x codex-usage && mv codex-usage /usr/local/bin/
 
-# macOS (Intel)
-curl -fSL https://github.com/SamuelLHuber/ai-sub-usage-tracker/releases/latest/download/codex-usage-macos-amd64 -o codex-usage
-chmod +x codex-usage && mv codex-usage /usr/local/bin/
-
 # Linux (x86_64)
 curl -fSL https://github.com/SamuelLHuber/ai-sub-usage-tracker/releases/latest/download/codex-usage-linux-amd64 -o codex-usage
 chmod +x codex-usage && sudo mv codex-usage /usr/local/bin/
