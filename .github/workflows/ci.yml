@@ -15,14 +15,33 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Syntax check
-        run: python -m py_compile codex-usage
+      - name: Syntax check (all Python files)
+        run: |
+          python -m py_compile codex-usage
+          python -m py_compile claude-usage
+          python -m py_compile ai-usage
+          python -m py_compile ai_usage/cli.py
+          python -m py_compile ai_usage/core/models.py
+          python -m py_compile ai_usage/core/display.py
+          python -m py_compile ai_usage/core/balancer.py
+          python -m py_compile ai_usage/providers/base.py
+          python -m py_compile ai_usage/providers/codex.py
+          python -m py_compile ai_usage/providers/claude.py
 
       - name: Check --help exits cleanly
-        run: python codex-usage --help
+        run: |
+          python ai-usage --help
+          python codex-usage --help
+          python claude-usage --help
 
       - name: Check --json without auth (should fail gracefully)
         run: |
-          result=$(python codex-usage --json 2>&1) || true
+          result=$(python ai-usage --json 2>&1) || true
           echo "$result"
-          # Should mention no auth files, not crash
+          # Should mention no accounts, not crash
+
+      - name: Check --provider filter with unknown provider
+        run: |
+          result=$(python ai-usage --provider unknown --json 2>&1) || true
+          echo "$result"
+          echo "$result" | python -c "import sys,json; d=json.load(sys.stdin); assert 'error' in d"

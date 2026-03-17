@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+"""ai-usage — Unified AI subscription usage tracker."""
+from ai_usage.cli import main
+main()

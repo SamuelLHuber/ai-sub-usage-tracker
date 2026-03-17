@@ -15,11 +15,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: codex-usage-linux-amd64
+            artifact_prefix: linux-amd64
           - os: macos-latest
-            artifact: codex-usage-macos-arm64
+            artifact_prefix: macos-arm64
           - os: windows-latest
-            artifact: codex-usage-windows-amd64.exe
+            artifact_prefix: windows-amd64
 
     runs-on: ${{ matrix.os }}
 
@@ -33,21 +33,41 @@ jobs:
       - name: Install PyInstaller
         run: pip install pyinstaller
 
-      - name: Build binary
+      - name: Build ai-usage binary
         run: |
           pyinstaller \
             --onefile \
-            --name ${{ matrix.artifact }} \
+            --name ai-usage-${{ matrix.artifact_prefix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }} \
+            --strip \
+            --noupx \
+            ai-usage
+        shell: bash
+
+      - name: Build codex-usage binary (backward compat)
+        run: |
+          pyinstaller \
+            --onefile \
+            --name codex-usage-${{ matrix.artifact_prefix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }} \
             --strip \
             --noupx \
             codex-usage
         shell: bash
 
-      - name: Upload artifact
+      - name: Build claude-usage binary
+        run: |
+          pyinstaller \
+            --onefile \
+            --name claude-usage-${{ matrix.artifact_prefix }}${{ matrix.os == 'windows-latest' && '.exe' || '' }} \
+            --strip \
+            --noupx \
+            claude-usage
+        shell: bash
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}*
+          name: binaries-${{ matrix.artifact_prefix }}
+          path: dist/*
 
   release:
     needs: build
