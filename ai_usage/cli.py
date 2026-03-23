@@ -5,14 +5,15 @@ Check rate-limit usage across all your AI coding subscriptions
 (OpenAI Codex, Anthropic Claude, …) with one command.
 
 Usage:
-  ai-usage                          # all providers, all accounts
-  ai-usage --provider codex         # only Codex accounts
-  ai-usage --provider claude        # only Claude accounts
-  ai-usage --json                   # machine-readable JSON
-  ai-usage --fix                    # switch to best account (providers that support it)
-  ai-usage --fix --provider codex   # only fix Codex
-  ai-usage --compact                # one-line-per-account table view
-  ai-usage --workers 50             # control concurrency (default: 20)
+  ai-usage                               # all providers, all accounts
+  ai-usage --provider codex              # only Codex accounts
+  ai-usage --provider claude             # only Claude accounts
+  ai-usage --json                        # machine-readable JSON
+  ai-usage --fix                         # switch to best account (providers that support it)
+  ai-usage --fix --provider codex        # only fix Codex
+  ai-usage login --provider codex        # interactive Codex relogin helper
+  ai-usage --compact                     # one-line-per-account table view
+  ai-usage --workers 50                  # control concurrency (default: 20)
 """
 
 from __future__ import annotations
@@ -111,7 +112,11 @@ def parse_args() -> dict:
         "compact": False,
         "provider": None,     # None = all providers
         "workers": DEFAULT_WORKERS,
+        "command": None,
     }
+    if args and args[0] == "login":
+        opts["command"] = "login"
+        args = args[1:]
     i = 0
     while i < len(args):
         if args[i] == "--json":
@@ -140,6 +145,15 @@ def main() -> None:
     compact_mode: bool = opts["compact"]
     max_workers: int = opts["workers"]
     provider_filter: str | None = opts["provider"]
+    command: str | None = opts["command"]
+
+    if command == "login":
+        if provider_filter != "codex":
+            print(f"{RED}ai-usage login currently supports Codex only.{RESET}")
+            print("Usage: ai-usage login --provider codex")
+            sys.exit(1)
+        provider = CodexProvider()
+        sys.exit(provider.interactive_login())
 
     # Select providers
     if provider_filter:

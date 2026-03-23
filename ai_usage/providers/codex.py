@@ -15,6 +15,8 @@ import base64
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -119,6 +121,95 @@ def _account_identity_key(snapshot: dict) -> tuple[str, str]:
     if user_id:
         return (snapshot.get("account_id", ""), user_id)
     return (snapshot.get("account_id", ""), snapshot.get("email", "unknown"))
+
+
+def _classify_discovered_entries(entries: list[dict]) -> None:
+    account_groups: dict[str, list[dict]] = {}
+    identity_groups: dict[tuple[str, str], list[dict]] = {}
+    for entry in entries:
+        account_groups.setdefault(entry.get("account_id", ""), []).append(entry)
+        identity_key = entry.get("identity_key")
+        if identity_key is not None:
+            identity_groups.setdefault(identity_key, []).append(entry)
+
+    for entry in entries:
+        shared_group = account_groups.get(entry.get("account_id", ""), [])
+        duplicate_group = identity_groups.get(entry.get("identity_key"), [])
+        entry["shared_account_files"] = sorted({item.get("path", "") for item in shared_group if item.get("path")})
+        entry["duplicate_identity_files"] = sorted({item.get("path", "") for item in duplicate_group if item.get("path")})
+
+
+def _profile_name_from_path(path: str) -> str:
+    p = Path(path)
+    if p.name == "auth.json":
+        return "auth"
+    if p.name.endswith(".auth.json"):
+        return p.name[:-10]
+    return p.stem
+
+
+def _format_codex_profile_rows(entries: list[dict]) -> str:
+    rows: list[tuple[str, str, str, str]] = []
+    for entry in entries:
+        rows.append((
+            Path(entry.get("path", "")).name,
+            entry.get("account_id", ""),
+            entry.get("email", "unknown"),
+            entry.get("plan_type", "unknown"),
+        ))
+
+    widths = [len(h) for h in ("file", "account_id", "email", "plan")]
+    for row in rows:
+        for i, value in enumerate(row):
+            widths[i] = max(widths[i], len(str(value)))
+
+    out = ["Current ~/.codex profiles:\n"]
+    headers = ["file", "account_id", "email", "plan"]
+    out.append("  " + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)))
+    out.append("  " + "  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        out.append("  " + "  ".join(str(v).ljust(widths[i]) for i, v in enumerate(row)))
+
+    duplicate_identity = [
+        entry for entry in entries
+        if len(entry.get("duplicate_identity_files", [])) > 1
+    ]
+    shared_accounts = [
+        entry for entry in entries
+        if len(entry.get("shared_account_files", [])) > 1
+    ]
+
+    out.append("")
+    if duplicate_identity:
+        out.append("Duplicate identities found:")
+        seen: set[tuple[str, str]] = set()
+        for entry in entries:
+            identity_key = entry.get("identity_key")
+            if not identity_key or identity_key in seen:
+                continue
+            dupes = entry.get("duplicate_identity_files", [])
+            if len(dupes) > 1:
+                seen.add(identity_key)
+                out.append(f"  {identity_key[0]} / {identity_key[1]}: " + ", ".join(Path(p).name for p in dupes))
+    else:
+        out.append("No duplicate identities found.")
+
+    if shared_accounts:
+        out.append("")
+        out.append("Shared workspace account_ids found:")
+        seen_account_ids: set[str] = set()
+        for entry in entries:
+            account_id = entry.get("account_id", "")
+            if not account_id or account_id in seen_account_ids:
+                continue
+            group = entry.get("shared_account_files", [])
+            unique_identities = {
+                item.get("identity_key") for item in entries if item.get("account_id") == account_id
+            }
+            if len(unique_identities) > 1:
+                seen_account_ids.add(account_id)
+                out.append(f"  {account_id}: " + ", ".join(Path(p).name for p in group))
+    return "\n".join(out)
 
 
 def _codex_snapshot_from_auth(data: dict) -> dict | None:
@@ -330,23 +421,122 @@ class CodexProvider(UsageProvider):
         # Also check ~/.pi/agent/auth.json for an openai-codex entry
         self._add_pi_account(entries, seen_accounts, active_identity_key)
 
-        account_groups: dict[str, list[dict]] = {}
-        identity_groups: dict[tuple[str, str], list[dict]] = {}
-        for entry in entries:
-            account_groups.setdefault(entry.get("account_id", ""), []).append(entry)
-            identity_key = entry.get("identity_key")
-            if identity_key is not None:
-                identity_groups.setdefault(identity_key, []).append(entry)
-
-        for entry in entries:
-            shared_group = account_groups.get(entry.get("account_id", ""), [])
-            duplicate_group = identity_groups.get(entry.get("identity_key"), [])
-            entry["shared_account_files"] = sorted({item.get("path", "") for item in shared_group if item.get("path")})
-            entry["duplicate_identity_files"] = sorted({item.get("path", "") for item in duplicate_group if item.get("path")})
+        _classify_discovered_entries(entries)
 
         # Sort: active first, then alphabetically by email
         entries.sort(key=lambda x: (not x.get("is_active", False), x.get("email", "")))
         return entries
+
+    def interactive_login(self) -> int:
+        entries = self.discover_accounts()
+        print("=== Codex relogin helper ===")
+        print()
+        print(_format_codex_profile_rows(entries))
+        print()
+        print("Enter the profile names you want to relogin/save.")
+        print("Examples: aione-dtech aitwo-dtech aithree-dtech")
+        print("         or press Enter to use the suggested duplicate identities above.")
+        print("         If there are no duplicate identities, nothing is auto-selected.")
+        try:
+            input_value = input("> ").strip()
+        except KeyboardInterrupt:
+            print()
+            return 130
+
+        if input_value:
+            profiles = [part for part in input_value.split() if part]
+        else:
+            profiles = []
+            seen: set[str] = set()
+            for entry in entries:
+                duplicates = entry.get("duplicate_identity_files", [])
+                if len(duplicates) > 1:
+                    profile = _profile_name_from_path(entry.get("path", ""))
+                    if profile != "auth" and profile not in seen:
+                        seen.add(profile)
+                        profiles.append(profile)
+
+        if not profiles:
+            print("No profiles selected. Exiting.")
+            return 0
+
+        print()
+        print("Profiles to refresh: " + " ".join(profiles))
+
+        for profile in profiles:
+            print()
+            print("============================================================")
+            print(f"Profile: {profile}")
+            print("1) A browser/device login will open for the account you want")
+            print("2) Complete login for the intended email")
+            print(f"3) This command will save ~/.codex/auth.json to ~/.codex/{profile}.auth.json")
+            print()
+            try:
+                input(f"Press Enter to run 'codex login' for {profile}...")
+            except KeyboardInterrupt:
+                print()
+                return 130
+
+            completed = subprocess.run(["codex", "login"])
+            if completed.returncode != 0:
+                print(f"codex login failed with exit code {completed.returncode}")
+                return completed.returncode
+
+            active_data = _read_json_file(CODEX_DIR / "auth.json")
+            snapshot = _codex_snapshot_from_auth(active_data) if active_data else None
+            if not snapshot:
+                print(f"Failed to read {CODEX_DIR / 'auth.json'} after login")
+                return 1
+
+            print()
+            print("Detected active login:")
+            print(f"  email:      {snapshot.get('email', 'unknown')}")
+            print(f"  plan:       {snapshot.get('plan_type', 'unknown')}")
+            print(f"  account_id: {snapshot.get('account_id', 'unknown')}")
+            if snapshot.get("user_id"):
+                print(f"  user_id:    {snapshot['user_id']}")
+            print()
+            try:
+                confirm = input(f"Save this login to {profile}.auth.json? [y/N] ").strip().lower()
+            except KeyboardInterrupt:
+                print()
+                return 130
+
+            if confirm not in ("y", "yes"):
+                print(f"Skipped saving {profile}.")
+                continue
+
+            dest = CODEX_DIR / f"{profile}.auth.json"
+            shutil.copy2(CODEX_DIR / "auth.json", dest)
+            os.chmod(str(dest), 0o600)
+
+            refreshed_entries = self.discover_accounts()
+            matching = next((e for e in refreshed_entries if e.get("path") == str(dest)), None)
+            print()
+            print(f"Saved profile: {dest}")
+            print(f"  email:      {snapshot.get('email', 'unknown')}")
+            print(f"  plan:       {snapshot.get('plan_type', 'unknown')}")
+            print(f"  account_id: {snapshot.get('account_id', 'unknown')}")
+            if snapshot.get("user_id"):
+                print(f"  user_id:    {snapshot['user_id']}")
+            if matching:
+                dupes = matching.get("duplicate_identity_files", [])
+                shared = matching.get("shared_account_files", [])
+                if dupes:
+                    print("  matching identity files:")
+                    for path in dupes:
+                        print(f"    - {Path(path).name}")
+                if len(shared) > 1:
+                    print("  shared workspace account files:")
+                    for path in shared:
+                        print(f"    - {Path(path).name}")
+
+        print()
+        print("=== Final profile state ===")
+        print(_format_codex_profile_rows(self.discover_accounts()))
+        print()
+        print("Done. You can now run: ai-usage --provider codex")
+        return 0
 
     @staticmethod
     def _add_pi_account(
