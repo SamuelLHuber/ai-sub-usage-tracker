@@ -65,6 +65,7 @@ def handle_fix(
     json_mode: bool,
     switch_fn,             # callable(AccountUsage) -> bool
     backup_fn=None,        # callable(quiet: bool) -> bool
+    already_active_fn=None,  # callable(AccountUsage, AccountUsage | None, list[AccountUsage]) -> bool
 ) -> None:
     """Handle --fix: switch to the best account within a single provider group.
 
@@ -79,8 +80,12 @@ def handle_fix(
         sys.exit(1)
 
     current_active = next((r for r in results if r.is_active), None)
-    already_active = current_active is not None and current_active.name == best.name
+    if already_active_fn is not None:
+        already_active = already_active_fn(best, current_active, results)
+    else:
+        already_active = current_active is not None and current_active.name == best.name
     is_limited = best.limit_reached
+    same_account = current_active is not None and current_active.name == best.name
 
     if already_active:
         if is_limited:
@@ -121,7 +126,7 @@ def handle_fix(
     if switch_fn(best):
         if json_mode:
             out: dict = {
-                "action": "switched",
+                "action": "synced" if same_account else "switched",
                 "provider": best.provider,
                 "account": best.name,
                 "email": best.email,
@@ -133,9 +138,13 @@ def handle_fix(
                 out["resets_in"] = format_time_remaining(binding_reset_seconds(best))
             print(json.dumps(out))
         else:
-            prev_name = current_active.email if current_active else "unknown"
-            print(f"  {GREEN}{BOLD}⚡ Switched active account{RESET}")
-            print(f"    {DIM}{prev_name}{RESET} → {BOLD}{best.email}{RESET} {DIM}({best.name}){RESET}")
+            if same_account:
+                print(f"  {GREEN}{BOLD}⚡ Synchronized active account{RESET}")
+                print(f"    {BOLD}{best.email}{RESET} {DIM}({best.name}){RESET}")
+            else:
+                prev_name = current_active.email if current_active else "unknown"
+                print(f"  {GREEN}{BOLD}⚡ Switched active account{RESET}")
+                print(f"    {DIM}{prev_name}{RESET} → {BOLD}{best.email}{RESET} {DIM}({best.name}){RESET}")
             if is_limited:
                 print(f"    {YELLOW}⚠ Still rate-limited{RESET} (best available, resets in {format_time_remaining(binding_reset_seconds(best))})")
             else:

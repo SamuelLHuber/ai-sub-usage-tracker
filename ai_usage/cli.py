@@ -203,6 +203,7 @@ def main() -> None:
                 json_mode,
                 switch_fn=prov.switch_account,
                 backup_fn=prov.ensure_backup,
+                already_active_fn=getattr(prov, "already_active", None),
             )
 
 

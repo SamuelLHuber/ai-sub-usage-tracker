@@ -168,6 +168,12 @@ def display_detailed(results: list[AccountUsage]) -> None:
                 identity = f"{BOLD}{r.name or r.provider}{RESET}"
             print(f"  {identity} [{plan_badge}]{active_badge}{unbacked_badge}")
             print(f"  Status: {status_icon}")
+            shared_count = r.meta.get("shared_account_count", 0)
+            duplicate_count = r.meta.get("duplicate_identity_count", 0)
+            if shared_count and shared_count > 1:
+                print(f"  {DIM}Shared workspace account: {shared_count} profiles map to this account_id{RESET}")
+            if duplicate_count and duplicate_count > 1:
+                print(f"  {YELLOW}Duplicate identity files: {duplicate_count} files map to the same user/account identity{RESET}")
             print()
 
             fh = r.five_hour
@@ -234,8 +240,10 @@ def display_compact(results: list[AccountUsage]) -> None:
 
             status = f"{RED}LIMITED{RESET}" if r.limit_reached else f"{GREEN}OK{RESET}"
             unbacked = f" {YELLOW}!{RESET}" if r.meta.get("has_backup") is False else ""
+            shared = f" {DIM}S{RESET}" if r.meta.get("shared_account_count", 0) > 1 else ""
+            duplicate = f" {YELLOW}D{RESET}" if r.meta.get("duplicate_identity_count", 0) > 1 else ""
 
-            print(f"  {active} {email:<33} {plan:<6} {fh_col} {sd_col} {reset:<10} {status}{unbacked}")
+            print(f"  {active} {email:<33} {plan:<6} {fh_col} {sd_col} {reset:<10} {status}{unbacked}{shared}{duplicate}")
 
         print()
 

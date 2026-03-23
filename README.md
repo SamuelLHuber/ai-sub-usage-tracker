@@ -103,11 +103,14 @@ claude-usage --json      # JSON output
 
 ### `--fix` load-balancing (Codex)
 
-Automatically switches `~/.codex/auth.json` to the best account:
+Automatically switches the active Codex account everywhere it is used:
+
+- `~/.codex/auth.json`
+- `~/.pi/agent/auth.json` (`openai-codex`)
 
 1. If any accounts are **not rate-limited** → picks the one with the most 7-day headroom
 2. If **all are limited** → picks the one that resets soonest
-3. Idempotent — won't switch if already on the best account
+3. Idempotent — won't switch if both Codex and Pi are already on the best account
 
 ### Backup safety
 
@@ -115,7 +118,8 @@ The `--fix` command **never overwrites an unbacked auth file**. Before switching
 
 1. Reads the current `auth.json` and checks if its `account_id` exists in any `*.auth.json`
 2. If no backup exists, **automatically creates one** (e.g. `samuel.auth.json`)
-3. Only then overwrites `auth.json` with the new account
+3. Also creates a backup of `~/.pi/agent/auth.json` for the current Pi Codex account when needed
+4. Only then overwrites the active auth files with the new account
 
 ## Auth setup
 
