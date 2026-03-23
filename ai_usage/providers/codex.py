@@ -678,23 +678,25 @@ class CodexProvider(UsageProvider):
         current_active: AccountUsage | None,
         results: list[AccountUsage],
     ) -> bool:
-        expected_account_id = best.meta.get("account_id")
-        if not expected_account_id:
+        # Use the full identity_key (account_id, user_id) to distinguish
+        # different users within the same shared workspace account.
+        expected_identity_key = best.meta.get("identity_key")
+        if not expected_identity_key:
             return current_active is not None and current_active.name == best.name
 
-        codex_account_id = None
+        codex_identity_key = None
         codex_data = _read_json_file(CODEX_DIR / "auth.json")
-        snapshot = _codex_snapshot_from_auth(codex_data) if codex_data else None
-        if snapshot:
-            codex_account_id = snapshot["account_id"]
+        codex_snapshot = _codex_snapshot_from_auth(codex_data) if codex_data else None
+        if codex_snapshot:
+            codex_identity_key = _account_identity_key(codex_snapshot)
 
-        pi_account_id = None
+        pi_identity_key = None
         pi_data = _read_json_file(PI_AUTH_FILE)
-        snapshot = _codex_snapshot_from_pi(pi_data) if pi_data else None
-        if snapshot:
-            pi_account_id = snapshot["account_id"]
+        pi_snapshot = _codex_snapshot_from_pi(pi_data) if pi_data else None
+        if pi_snapshot:
+            pi_identity_key = _account_identity_key(pi_snapshot)
 
-        return codex_account_id == expected_account_id and pi_account_id == expected_account_id
+        return codex_identity_key == expected_identity_key and pi_identity_key == expected_identity_key
 
     def switch_account(self, usage: AccountUsage) -> bool:
         source = Path(usage.meta["path"])

@@ -275,20 +275,22 @@ class CodexFixTests(unittest.TestCase):
             },
         })
 
+        identity_one = (self.account_one, "user-one")
         best = AccountUsage(
             provider="codex",
             name="work",
             email="one@example.com",
-            meta={"account_id": self.account_one},
+            meta={"account_id": self.account_one, "identity_key": identity_one},
         )
         current = AccountUsage(
             provider="codex",
             name="work",
             email="one@example.com",
             is_active=True,
-            meta={"account_id": self.account_one},
+            meta={"account_id": self.account_one, "identity_key": identity_one},
         )
 
+        # codex has account_one but pi has account_two → not active
         self.assertFalse(self.provider.already_active(best, current, []))
 
         self._write_pi_auth({
@@ -301,7 +303,50 @@ class CodexFixTests(unittest.TestCase):
             },
         })
 
+        # both codex and pi now have account_one/user-one → active
         self.assertTrue(self.provider.already_active(best, current, []))
+
+    def test_already_active_distinguishes_shared_workspace_users(self) -> None:
+        """Different users on the same account_id must NOT be considered already active."""
+        access_other = _jwt({
+            "email": "other@example.com",
+            "exp": 2_000_002_222,
+            "sub": "auth0|other",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": self.account_one,
+                "chatgpt_plan_type": "team",
+                "chatgpt_user_id": "user-other",
+            },
+        })
+
+        # auth.json and pi both have user-other on the same account_id
+        self._write_codex_auth(
+            self.codex_dir / "auth.json",
+            access=access_other,
+            refresh="refresh-other",
+            account_id=self.account_one,
+        )
+        self._write_pi_auth({
+            "openai-codex": {
+                "type": "oauth",
+                "access": access_other,
+                "refresh": "refresh-other",
+                "expires": 2_000_002_222_000,
+                "accountId": self.account_one,
+            },
+        })
+
+        # best is user-one on the same account_id
+        identity_one = (self.account_one, "user-one")
+        best = AccountUsage(
+            provider="codex",
+            name="one",
+            email="one@example.com",
+            meta={"account_id": self.account_one, "identity_key": identity_one},
+        )
+
+        # Same account_id but different user → should NOT be already active
+        self.assertFalse(self.provider.already_active(best, None, []))
 
     def test_ensure_backup_creates_codex_named_backup_and_pi_backup(self) -> None:
         self._write_codex_auth(
